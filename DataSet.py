@@ -4,42 +4,50 @@ from matplotlib.ticker import MultipleLocator, FormatStrFormatter
 import sys
 import pandas as pd 
 import scipy.io as spio
+from itertools import groupby
 import Waveform
-import cPickle as pickle 
+import pickle 
+from scipy import optimize
 import time
 import math
 
 class DataSet:
-	#Creates an class filled with all the events out of filename
-	#data is only filled into event_array on a function-by-function
-	#basis. If a function only needs 1 event, it will only load 1 event
-	def __init__(self, filename, acdc_clock=40, calibration_file=None):
+	#A class that is a CSV reader for ACDC ascii data. 
+	#The class turns the input file into a pandas dataframe.
+	#Every time an event is requested, the class uses that
+	#dataframes random access attributes to pull data. 
 
-		self.data = pd.read_csv(filename,delimiter='\s+', index_col=[0, 1, 2])
+	#filename: .acdc filename. assumes metadata file is the same name with .meta tag
+	#acdc_clock: the onboard ACDC write clock frequency in MHz. used to calculate avg timestep
+	def __init__(self, filename, acdc_clock=25):
+
+		self.data = pd.read_csv(filename+".acdc", sep=" ", index_col=[0, 1, 2])
+
 		#peddata not used yet
 		#self.peddata = pd.read_csv(self.filename[:-4]+"ped",delimiter='\s+', index_col=[0,1])
-		self.metadata = pd.read_csv(filename[:-4]+"meta",delimiter='\s+', index_col=[0,1])
+		self.metadata = pd.read_csv(filename+".meta",sep=" ", index_col=[0,1])
 
-		self.nsamples = None
-		self.nsamples = self.get_nsamples()
+		self.nsamples = 256
 
-		self.timestep = 1.0/(self.nsamples*acdc_clock*1e6) #nanoseconds
-		
-		#calfile holds info about individual LAPPD
-		#stripline velocities and others...
-		#*not yet implemented
-		self.cal_file = calibration_file 
+		self.timestep = 1.0e9/(self.nsamples*acdc_clock*1e6) #nanoseconds
 
 
-
-
+	#this function returns a waveform object
+	#by accessing the CSV pandas dataframe 
+	#and assuming a constant sampling time. 
 	def get_waveform(self, event, board, channel):
-		ADCcounts_to_mv = 1.2*1000.0/4096.0
+		ADCcounts_to_mv = 1200./4096.
 		if((event, board, channel) in self.data.index):
-			mv_values = self.data.loc[(event, board, channel)].tolist()
+			mv_values = self.data.loc[(event, board, channel)].values.tolist()
+			#cludge because chained data somehow ends up different from unchained data
+			if(len(mv_values) == 1):
+				mv_values = mv_values[0]
 			mv_values = [_*ADCcounts_to_mv for _ in mv_values]
 			times = [i*self.timestep for i in range(self.get_nsamples())]
-			return Waveform.Waveform(mv_values, times)
+			thewfm = Waveform.Waveform(mv_values, times)
+			#remove spikes
+			#thewfm.remove_spikes()
+			return thewfm
 
 		else:
 			#print "Could not find that channel/event/board in dataset"
@@ -52,35 +60,66 @@ class DataSet:
 	def get_max_events(self):
 		return max(self.data.index.levels[0])
 
+	#list of channel numbers. e.g. range(1, 31)
 	def get_chs(self):
 		return list(self.data.index.levels[2])
 
+	#list of board indices. all boards that appear
+	#as having triggered in the dataset.
 	def get_boards(self):
 		return list(self.data.index.levels[1])
 
+	#check which board triggered for a given event
+	def which_boards_triggered(self, event):
+		all_possible_boards = self.get_boards()
+		triggered_boards = []
+		ex_channel = self.get_chs()[0] #an example channel as a filler
+		for b in all_possible_boards:
+			if((event, b, ex_channel) in self.data.index):
+				triggered_boards.append(b)
+
+		return triggered_boards
+
+
+	#assuming that every event
+	#has the same number of samples
+	#for each waveform channel, return 
+	#that number of samples. 
 	def get_nsamples(self):
 		if(self.nsamples is None):
 			return len(self.data.iloc[0])
 		else:
 			return self.nsamples
 
+	#timestep based on input to dataset object
 	def get_timestep(self):
 		return self.timestep
 
-	#Writes the dataset object to a pickle file
-	def write_pickle(self, filename):
-		pickle.dump(self, open(filename, 'wb'))
-				
-	#return a list of all voltages from all samples
-	def get_all_sample_values(self):
-		all_samples = []
-		for i, row in self.data.iterrows():
-			for sm in row:
-				all_samples.append(sm)
+	#plots all channels for a list of boards and event on the same plot
+	def plot_waveforms_overlayed(self, event, boards, channels):
+		fig, ax = plt.subplots(figsize=(13, 9))
+		for j, bo in enumerate(boards):
+			for i, ch in enumerate(channels):
+				thewav = self.get_waveform(event, bo, ch)
+				if(thewav is None):
+					continue
+				thewav.plot(ax)
+				ax.get_lines()[-1].set_color('k')
+				ax.get_lines()[-1].set_linewidth(3)
+				ax.set_xlim([5, 25])
+				#ax.set_title("CH = " + str(ch))
+				ax.set_xlabel('sample time (ns)', fontsize=16)
+				ax.set_ylabel('sampled voltage (mV)', fontsize=16)
+				ax.get_xaxis().set_tick_params(labelsize=15, length=14, width=2, which='major')
+				ax.get_xaxis().set_tick_params(labelsize=15,length=7, width=2, which='minor')
+				ax.get_yaxis().set_tick_params(labelsize=15,length=14, width=2, which='major')
+				ax.get_yaxis().set_tick_params(labelsize=15,length=7, width=2, which='minor')
 
-		return all_samples
+		return ax
 
 
+	#plots all waveforms for a list of boards on individual
+	#subplots per channel. 
 	def plot_waveforms_separated(self, event, boards, channels):
 
 		if(len(channels) < 5):
@@ -91,12 +130,14 @@ class DataSet:
 			nrows = int(math.ceil(float(len(channels))/ncols))
 
 		fig, ax = plt.subplots(figsize=(12,7),ncols=ncols, nrows=nrows)
+		fig.suptitle("Event " + str(event))
+		#flatten ax array to 1D
 		ax_1d = []
 		for _ in ax:
 			for i in range(len(_)):
 				ax_1d.append(_[i])
 
-		colors = ['b', 'g', 'r']
+		colors = ['r','g', 'b', 'm', 'c']
 		for j, bo in enumerate(boards):
 			for i, ch in enumerate(channels):
 				thewav = self.get_waveform(event, bo, ch)
@@ -110,6 +151,8 @@ class DataSet:
 
 		return ax
 
+	#plots a single board's event as a heatmap with time
+	#on the x axis and channel number on y axis, color = mV
 	def plot_event_heatmap(self, event, board, ax=None):
 		if(ax is None):
 			fig, ax = plt.subplots()
@@ -118,10 +161,12 @@ class DataSet:
 		x = []
 		y = []
 		z=[]
-		times = np.arange(0, self.get_nsamples()*self.get_timestep()*1e9, self.get_timestep()*1e9)
 		channels = self.get_chs()
 		for j, ch in enumerate(channels):
 			wfm = self.get_waveform(event, board, ch)
+			if(wfm is None):
+				return
+			times = wfm.get_times()
 			sig = wfm.get_signal()
 			if(sig is None):
 				continue
@@ -134,14 +179,11 @@ class DataSet:
 
 		xbins = times
 		ybins = channels
-		h = ax.hist2d(x, y, bins=[xbins, ybins], weights=z, cmap=plt.inferno(), cmax=20, cmin=-50)
+		h = ax.hist2d(x, y, bins=[xbins, ybins], weights=z, cmap=plt.inferno())#, cmax=20, cmin=-70)
 		plt.colorbar(h[3],ax=ax)
-		plt.show()
-
 
 
 	#Plots numEvents random events from the dataset
-	#using 
 	def plot_random_events(self, nevts, boards=None, channels=None):
 		maxev = self.get_max_events()
 		if(channels is None):
@@ -153,15 +195,20 @@ class DataSet:
 		for i in range(nevts):
 			fig, ax = plt.subplots(nrows = len(boards))
 			ev = np.random.randint(maxev)
-			#self.plot_waveforms_separated(ev, boards, channels)
+			for b in boards:
+				print(self.which_channels_triggered(ev, b))
+
 			if(len(boards) == 1):
 				self.plot_event_heatmap(ev, boards[0], ax)
+				ax.set_title("event " + str(ev))
 			else:
-				for j, a in ax:
+				for j, a in enumerate(ax):
 					self.plot_event_heatmap(ev, boards[j], a)
+					a.set_title("event " + str(ev))
 
 			plt.show()
 
+	#loops through each event, plotting each time. 
 	def plot_all_events(self, boards=None, channels=None):
 		maxev = self.get_max_events()
 		if(channels is None):
@@ -169,314 +216,139 @@ class DataSet:
 		if(boards is None):
 			boards = self.get_boards()
 
-		
 		for ev in range(maxev):
 			fig, ax = plt.subplots(nrows = len(boards))
 			for b in boards:
-				print self.which_channels_triggered(ev, b)
+				print(self.which_channels_triggered(ev, b))
 
-			self.plot_waveforms_separated(ev, boards, channels)
-			plt.show()
-			continue
 			if(len(boards) == 1):
 				self.plot_event_heatmap(ev, boards[0], ax)
+				ax.set_title("event " + str(ev))
 			else:
-				for j, a in ax:
-					self.plot_event_heatmap(ev, boards[j], ax)
+				for j, a in enumerate(ax):
+					self.plot_event_heatmap(ev, boards[j], a)
+					a.set_title("event " + str(ev))
+
 				
 			plt.show()
 
 
 
-
-	#sums all of the pulse power spectral densities
-	#for all events, keeps channels separate
-	def get_summed_psds(self):
-		summed_chs = [[[] for _ in self.get_chs()] for _ in range(max(self.get_boards()))]
-		freqs = [] 	
-
-		for ev in range(self.get_max_events()):
-			for bo in self.get_boards():
-				for ch in self.get_chs():
-					wf = self.get_waveform(ev, bo, ch)
-					if(wf is None):
-						continue
-
-					psd, fs = wf.get_power_spectral_density()
-					if(len(summed_chs[bo][ch]) == 0):
-						summed_chs[bo][ch] = psd
-						freqs = fs
-						continue
-					else:
-						for j in range(len(psd)):
-							summed_chs[bo][ch] += psd[j]
-
-		#keeping it un-normalized, arbitrary units
-
-		return (freqs, summed_chs)
-
-	def plot_summed_psd_separated_channels(self, board):
-		freqs, summed = self.get_summed_psds()
-		fig, ax = plt.subplots(nrows=5, ncols=6)
-		#flatten ax array to 1D
-		ax_1d = []
-		for _ in ax:
-			for i in range(len(_)):
-				ax_1d.append(_[i])
-
-		for ch in self.get_chs():
-			ax_1d[ch].plot(freqs, summed[board][ch])
-			ax_1d[ch].set_title("CH = " + str(ch + 1))
-			ax_1d[ch].locator_params('x', nbins=10)
-
-		fig.suptitle("Board " + str(board) + " PSD, x-axis = freq. (GHz), y-axis = PSD (arb units)")
-		plt.show()
-
-	def plot_summed_psd_overlayed(self, channels, board):
-		fig, ax = plt.subplots()
-		freqs, summed = self.get_summed_psds()
-		for ch in self.get_chs():
-			ax.plot(freqs, summed[board][ch])
-			ax.set_title("Power spectral density of CH = " + str(ch + 1))
-			ax.set_xlabel("Freq (GHz)")
-			ax.set_ylabel("PSD arb. units")
-
-		plt.show()
-
-	#looks at all voltages in all events
-	#in the dataset and finds the
-	#minimum difference between two voltage samples
-	#to infer the resolution of the voltage measurement
-	#on the waveform
-	def get_minimum_voltage_binning(self):
-		samples = self.get_all_sample_values()
-		a, size = sorted(samples), len(samples)
-		res = [a[i + 1] - a[i] for i in xrange(size) if i+1 < size]
-		res = [_ for _ in res if _ > 1e-6]
-		return min(res) #mV
-
-
-
-
-#---place holder on updating code
-
-	#takes the dataset and takes every sample 
-	#from every event and every channel 
-	#and plots a histogram of the mV values. 
-	def plot_noise_dataset(self, outfilename):
-
-		#vbinwidth = self.get_minimum_voltage_binning()
-		vbinwidth = 1#mv
-		fig, ax = plt.subplots(nrows=5, ncols=6, figsize=(60, 30))
-		#flatten ax array to 1D
-		ax_1d = []
-		for _ in ax:
-			for i in range(len(_)):
-				ax_1d.append(_[i])
-		for ch in range(self.nch):
-			chsamples = []
-			for ev in self.event_array:
-				tempsamps = ev.get_all_samples([ch])
-				chsamples += tempsamps
-
-			bin_edges = np.arange(min(chsamples), max(chsamples), vbinwidth)
-			n, bins, patches = ax_1d[ch].hist(chsamples, bin_edges, lw=3, fc=None)
-			ax_1d[ch].set_title("CHANNEL = " + str(ch + 1))
-
-			#find full width half max of dataset
-			maxidx = list(n).index(max(n))
-			maxn = max(n)
-			bin_low = None
-			bin_high = None
-			#iterate forward from maxidx
-			for i, b_e in enumerate(bins[maxidx:]):
-				if(n[maxidx + i] <= 0.5*maxn):
-					bin_high = b_e
-					break
-			#iterate backwards from maxidx
-			for j, b_e in enumerate(bins[maxidx::-1]):
-				if(n[maxidx - j] <= 0.5*maxn):
-					bin_low = b_e
-					break
-			if(bin_low is None or bin_high is None):
-				print "failed finding FWHM"
-				continue
-
-			ax_1d[ch].axvspan(bin_low, bin_high, facecolor='y', alpha=0.3, label="FWHM: " + str(bin_high - bin_low) + "\nLower bound (mV): " + str(bin_low) + "\nLower bound (adc counts): " + str(bin_low*4096.0/1200.0))
-			ax_1d[ch].legend()
-			ax_1d[ch].set_xlabel("mV")
-			
-
-		plt.savefig(outfilename, bbox_inches='tight')
-
-
-	#takes the dataset and takes every sample 
-	#from every event and a select channel
-	#and plots a histogram of the mV values. 
-	def plotNoiseDatasetChs(self, outfilename, channel):
-
-		vbinwidth = self.getVoltageBinning()
-		fig, ax = plt.subplots(figsize=(15, 11))
-		#flatten ax array to 1D
-		ch = channel
-
-		chsamples = []
-		for ev in self.eventArray:
-			t, chwave = ev.getPulseWaveform(ch)
-			#t, chwave = ev.getPulseWaveformDCRemoved(ch)
-			for sample in chwave:
-				chsamples.append(sample)
-
-		bin_edges = np.arange(min(chsamples), max(chsamples), vbinwidth)
-		n, bins, patches = ax.hist(chsamples, bin_edges, lw=3, fc=None)
-		ax.set_title("CHANNEL = " + str(ch + 1))
-
-		#find full width half max of dataset
-		maxidx = list(n).index(max(n))
-		maxn = max(n)
-		bin_low = None
-		bin_high = None
-		#iterate forward from maxidx
-		for i, b_e in enumerate(bins[maxidx:]):
-			if(n[maxidx + i] <= 0.5*maxn):
-				bin_high = b_e
-				break
-		#iterate backwards from maxidx
-		for j, b_e in enumerate(bins[maxidx::-1]):
-			if(n[maxidx - j] <= 0.5*maxn):
-				bin_low = b_e
-				break
-		if(bin_low is None or bin_high is None):
-			print "failed finding FWHM"
-
-		ax.axvspan(bin_low, bin_high, facecolor='y', alpha=0.3, label="FWHM: " + str(bin_high - bin_low) + "\nLower bound (mV): " + str(bin_low) + "\nLower bound (adc counts): " + str(bin_low*4096.0/1200.0))
-		ax.legend()
-		ax.set_xlabel("mV")
-		
-
-		plt.savefig(outfilename, bbox_inches='tight')
-
-
-	
-
-	
-
-	def plot_overlay_nevents(self, nevts=None, channels=None):
-		if(nevts is None and self.num_events==0):
-			self.load_all_events()
-		elif(nevts is None):
-			pass
-		else:
-			self.load_random_events(nevts)
-
+	def plot_all_events_separated(self, boards=None, channels=None):
+		maxev = self.get_max_events()
 		if(channels is None):
-			channels = range(self.nch)
-
-		fig, ax = plt.subplots()
-		for ev in self.event_array:
-			ev.plot_waveforms_overlayed(channels, ax)
-
-		plt.show()
+			channels = self.get_chs()
+		if(boards is None):
+			boards = self.get_boards()
 
 
+		for ev in range(maxev):
+			for b in boards:
+				print(self.which_channels_triggered(ev, b))
 
+			self.plot_waveforms_separated(ev, boards, channels)
 
-
-	#-----------transit time spread for tektronix data--------#
-
-
-	#looks for a pulse in each channel. 
-	#find it's 10% of max. find it's time
-	#relative to a time where the laser trigger
-	#passes a constant threshold. return a list of times
-	#for all event in the loaded buffer
-	def get_tts_rel_trigger(self, trigchan, sig_chans, trig_thresh, sig_thresh, pulse_loc=None):
-		if(self.num_events == 0):
-			self.load_all_events()
-
-		skipped_events = 0
-		reltts = [[] for _ in sig_chans]
-		for ev in self.event_array:
-			#constant threshold discrimination on square laser trigger
-			trig_time = ev.get_laser_trigger_time(trigchan, trig_thresh)
-			if(trig_time is None):
-				#skip the event
-				skipped_events += 1
-				continue
-			
-			arrival_times = ev.get_pulse_arrival_times(sig_chans, sig_thresh, pulse_loc)
-			for i, at in enumerate(arrival_times):
-				#didn't find a pulse in this channel
-				#or thresholding didnt trigger
-				if(at is None):
-					continue
-				else:
-					reltts[i].append(at - trig_time)
-
-		return reltts
-
-
+				
+			plt.show()
 
 
 #------------ metadata functions -----------------#
-
-
-	def print_metadata(self, event, board, key=None):
+	#return a single metadata element
+	def get_metadata_element(self, event, board, key):
 		cols = list(self.metadata.columns.values)
 		if((event, board) in self.metadata.index):
-			if(key is None):
-				for c in cols:
-					print c + " \t\t\t " + str(self.metadata[c][(event, board)])
-			else:
-				print key + " \t\t\t" + str(self.metadata[key][(event, board)])
+			return self.metadata[key][(event, board)]
 		else:
-			print "Could not find metadata for event " + str(event) + " and board " + str(board)
+			print("Could not find metadata for event " + str(event) + " and board " + str(board))
 
-
-	def get_all_metadata(self, data_key):
-		boards = []
-		events = []
-		values = []
-		for i,row in self.metadata.iterrows():
-			boards.append(i[1])
-			events.append(i[0])
-			values.append(int(row[data_key]))
-
-		return events, boards, values
-
-	#returns the trigger time 
-	#in units of "relative clock counts"
-	def get_event_time(self, event, board):
+	#this method is used to fill the metadata class. 
+	#it returns a dictionary of keys and values for metadata. 
+	def get_metadata_structure(self, event, board):
+		cols = list(self.metadata.columns.values)
+		metadict = {}
 		if((event, board) in self.metadata.index):
-			hi = self.metadata["dig_timestamp_hi"][(event, board)]
-			mid = self.metadata["dig_timestamp_mid"][(event, board)]
-			lo = self.metadata["dig_timestamp_lo"][(event, board)]
-			return hi*mid*lo 
+			for c in cols:
+				metadict[c] = self.metadata[c][(event, board)]
+			return metadict
 		else:
+			print("Could not find metadata for event " + str(event) + " and board " + str(board))
 			return None
 
-	#returns a list of which channels triggered 
-	#from self trigger
-	def which_channels_triggered(self, event, board):
-		if((event, board) in self.metadata.index):
-			selftrig_dec = self.metadata["reg_self_trig"][(event, board)]
-			selftrig_binstr = str(bin(selftrig_dec))
-			chlist = []
-			for i in range(len(self.get_chs()) + 1):
-				j = -1*i
-				if(selftrig_binstr[j] == 'b'):
+
+	#print a table of statistics on
+	#which boards triggered on which events
+	#and what multiplicity throughout the dataset
+	def print_board_statistics(self):
+		maxev = self.get_max_events()
+		boards_allevs = [] #list of all event board numbers, including empty []
+		for ev in range(maxev):
+			boards_allevs.append(self.which_boards_triggered(ev))
+
+
+		keys = []
+		for el in boards_allevs:
+			if(el in keys):
+				continue
+			else:
+				keys.append(el)
+
+		freqs = [0 for _ in keys]
+
+		for el in boards_allevs:
+			for i, k in enumerate(keys):
+				if(el == k):
+					freqs[i] += 1
+
+		print("-----Board multiplicities-----")
+		for i, k in enumerate(keys):
+			print("Boards: ", end='')
+			if(len(k) == 0):
+				print("no-board-trigs,", end='')
+			else:
+				for b in k:
+					if(b == k[-1]):
+						print(str(b) + ",", end='')
+					else:
+						print(str(b) + "&", end='')
+
+			print("\t\t", end='')
+			print(str(freqs[i]))
+
+
+
+	#board_combs is a list of board combinations that
+	#are allowed to pass the cut. = [[0,2],[1,3],[1,2,3,4]...]
+	def get_event_nos_with_boards(self, board_combs):
+		maxev = self.get_max_events()
+		pass_events = []
+		for ev in range(maxev):
+			bs = self.which_boards_triggered(ev) #which ones are in this event
+			for bc in board_combs:
+				bc.sort()
+				bs.sort()
+				if(bc == bs):
+					#todo: check if they are within a clock cut
+					pass_events.append(ev)
 					break
 
-				if(selftrig_binstr[j] == '1'):
-					chlist.append(i)
-			return chlist
+		return pass_events
 
-		else:
-			return None
 
-	#
-	def find_closest_events(self, event, board):
-		pass
+
+
+
+
+
+
+
+			
+
+
+
+
+
+
+
 
 
 
